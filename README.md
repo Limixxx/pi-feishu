@@ -25,6 +25,14 @@
 pi install npm:pi-feishu
 ```
 
+```bash
+pi install ./
+```
+
+```bash
+pi install git:github.com/Limixxx/pi-feishu
+```
+
 ## 配置
 
 ### 获取凭证
