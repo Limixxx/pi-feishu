@@ -41,7 +41,7 @@ import type { Static } from "typebox";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { FeishuClient } from "./feishu-client.js";
+import { FeishuClient, isTransientError } from "./feishu-client.js";
 import type { InboundResource } from "./feishu-client.js";
 import type { FeishuConfig } from "./types.js";
 
@@ -49,6 +49,11 @@ import type { FeishuConfig } from "./types.js";
 
 /** 飞书 post 消息单条最大字符数（约 4000） */
 const MAX_TEXT_CHUNK = 4000;
+
+/** LLM 错误后延迟清理窗口（覆盖退避 2s/4s/8s + 抖动），30s */
+const ERROR_CLEANUP_DELAY_MS = 30_000;
+/** 进度卡片更新防抖间隔，≥500ms 才真正 patch 一次 */
+const CARD_PATCH_DEBOUNCE_MS = 500;
 
 /** 工具名到友好名称的映射 */
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -126,6 +131,12 @@ interface ChatState {
   progressCreating: boolean;
   /** 工具执行记录 */
   toolEntries: Array<{ name: string; status: "running" | "done" | "error" }>;
+
+  // ── 重试窗口 ──
+  /** 上一轮是否以 LLM 错误结束（决定 agent_end 走延迟清理） */
+  lastTurnError: boolean;
+  /** 进度卡片更新防抖定时器 */
+  progressDebounceTimer: ReturnType<typeof setTimeout> | null;
 }
 
 // ─── 扩展入口 ───────────────────────────────────────────
@@ -137,6 +148,9 @@ export default function (pi: ExtensionAPI) {
 
   /** 每个聊天独立的状态 */
   const chatStates: Map<string, ChatState> = new Map();
+
+  /** 延迟清理定时器：chatId → timer（重试窗口存在时非空） */
+  const cleanupTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
 
   // ─── 消息队列 ──────────────────────────────────────────
 
@@ -315,6 +329,8 @@ export default function (pi: ExtensionAPI) {
       progressMsgId: null,
       progressCreating: false,
       toolEntries: [],
+      lastTurnError: false,
+      progressDebounceTimer: null,
     });
 
     // 添加 Typing Reaction
@@ -520,11 +536,19 @@ export default function (pi: ExtensionAPI) {
     // ── 检测 LLM 错误 ──
     if (message.stopReason === "error") {
       const errMsg = message.errorMessage ?? "LLM 返回了未知错误";
-      client.sendMessage(state.chatId, `LLM 错误: ${errMsg}`, state.userMsgId).catch(() => {});
-      client.stopTyping(state.chatId, false).catch(() => {});
+      state.lastTurnError = true;
+      // 错误提示，注明自动重试；不再立即 stopTyping（等待重试 run 继续，或延迟清理补 CrossMark）
+      safeSend(
+        client.sendMessage(
+          state.chatId,
+          `⚠️ LLM 错误: ${errMsg}\nPI 将自动重试，请稍候…`,
+          state.userMsgId,
+        ),
+      );
       flashStatus("飞书: ⚠️ LLM 错误");
       return;
     }
+    state.lastTurnError = false;
 
     const textContent = extractTextFromMessage(message);
     if (!textContent) return;
@@ -535,21 +559,33 @@ export default function (pi: ExtensionAPI) {
     // 检查这一轮是否包含工具调用
     const hasToolCalls = message.content?.some((block: any) => block.type === "toolCall");
 
+    // 文本分块经 safeSend 串行发送（客户端节流队列自然形成背压）
+    const chunks = chunkText(processed, MAX_TEXT_CHUNK);
     if (hasToolCalls) {
       // 中间轮：assistant 有文本 + 工具调用 → 发送中间文本（回复到用户消息）
-      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk, state.userMsgId);
+        safeSend(client.sendMessage(state.chatId, chunk, state.userMsgId));
       }
     } else {
       // 最终轮（或无工具调用的单轮）→ 发送文本（新消息）
-      const chunks = chunkText(processed, MAX_TEXT_CHUNK);
       for (const chunk of chunks) {
-        client.sendMessage(state.chatId, chunk);
+        safeSend(client.sendMessage(state.chatId, chunk));
       }
     }
 
     flashStatus(`飞书: 📤 推送中 (${textContent.length}字)`);
+  });
+
+  // ─── agent_start → 取消延迟清理，恢复重试 run 的打字指示 ──
+
+  pi.on("agent_start", () => {
+    if (!client || client.getStatus() !== "connected") return;
+    // 重试 run 开始：取消挂在清理阶段的定时器，避免误删仍在进行的会话
+    cancelCleanup();
+    const state = findActiveState();
+    if (state) {
+      client.startTyping(state.chatId, state.userMsgId).catch(() => {});
+    }
   });
 
   // ─── agent_end → 清理 + 处理下一条排队消息 ──────────
@@ -561,11 +597,22 @@ export default function (pi: ExtensionAPI) {
 
     const chatId = state.chatId;
 
-    // 移除 Typing Reaction
-    client.stopTyping(chatId, true).catch(() => {});
-
-    // 清理当前状态
-    chatStates.delete(chatId);
+    if (state.lastTurnError) {
+      // 错误路径：延迟清理。保留 chatId/userMsgId 绑定，等待 LLM 自动重试。
+      // 若一定时间内没有重试 run，清理定时器会补 CrossMark 并删除状态。
+      state.toolEntries = [];
+      state.progressMsgId = null;
+      state.progressCreating = false;
+      if (state.progressDebounceTimer) {
+        clearTimeout(state.progressDebounceTimer);
+        state.progressDebounceTimer = null;
+      }
+      scheduleCleanup(chatId, ERROR_CLEANUP_DELAY_MS);
+    } else {
+      // 正常路径：立即移除 Typing Reaction + 清理状态
+      client.stopTyping(chatId, true).catch(() => {});
+      chatStates.delete(chatId);
+    }
 
     // 刷新所有队列（包括当前聊天）
     const queue = chatQueues.get(chatId);
@@ -573,6 +620,40 @@ export default function (pi: ExtensionAPI) {
     flushAllQueues();
     flashStatus("飞书: ✅ 完成");
   });
+
+  // ─── 延迟清理定时器（M4/M5 重试窗口）──────────────────────
+
+  /** 取消指定 chat 的清理定时器（chatId 为空则全部取消） */
+  function cancelCleanup(chatId?: string): void {
+    if (chatId != null) {
+      const t = cleanupTimers.get(chatId);
+      if (t) {
+        clearTimeout(t);
+        cleanupTimers.delete(chatId);
+      }
+      return;
+    }
+    for (const t of cleanupTimers.values()) clearTimeout(t);
+    cleanupTimers.clear();
+  }
+
+  /** 排队一个延迟清理：到期且仍无重试 run 时补 CrossMark 并删除状态 */
+  function scheduleCleanup(chatId: string, delayMs: number): void {
+    cancelCleanup(chatId);
+    const timer = setTimeout(() => {
+      cleanupTimers.delete(chatId);
+      const state = chatStates.get(chatId);
+      if (state) {
+        // 没有重试 run 接手：标记失败并收尾
+        client?.stopTyping(chatId, false).catch(() => {});
+        chatStates.delete(chatId);
+      }
+      // 清理到期后可能已空闲，尝试推进队列
+      flushAllQueues();
+    }, delayMs);
+    if (typeof timer === "object" && "unref" in timer) (timer as any).unref();
+    cleanupTimers.set(chatId, timer);
+  }
 
   // ─── Pi 空闲时刷新所有队列 ─────────────────────────────
 
@@ -583,6 +664,8 @@ export default function (pi: ExtensionAPI) {
   function flushAllQueues(): void {
     if (!client || client.getStatus() !== "connected") return;
     if (ctxRef && !ctxRef.isIdle()) return;
+    // 错误重试窗口内不推进队列，避免误出队新消息覆盖等待重试的状态（B4）
+    if (cleanupTimers.size > 0) return;
 
     for (const [chatId, queue] of chatQueues) {
       if (!queue.processing && queue.queue.length > 0) {
@@ -646,12 +729,9 @@ export default function (pi: ExtensionAPI) {
 
     const card = FeishuClient.buildStreamingCard(content, status);
 
-    // 情况 1: 卡片已创建 → 直接更新
+    // 情况 1: 卡片已创建 → 防抖后刷新（M6）
     if (state.progressMsgId) {
-      client.updateCard(state.progressMsgId, card).catch(() => {
-        state.progressMsgId = null;
-        state.progressCreating = false;
-      });
+      scheduleProgressPatch(state, card);
       return;
     }
 
@@ -675,6 +755,34 @@ export default function (pi: ExtensionAPI) {
       }
     }).catch(() => {
       state.progressCreating = false;
+    });
+  }
+
+  /** 防抖刷新已创建的进度卡片（M6）：相比每次事件立即 patch，这里合并高频更新 */
+  function scheduleProgressPatch(state: ChatState, card: ReturnType<typeof FeishuClient.buildStreamingCard>): void {
+    if (state.progressDebounceTimer) {
+      clearTimeout(state.progressDebounceTimer);
+    }
+    state.progressDebounceTimer = setTimeout(() => {
+      state.progressDebounceTimer = null;
+      if (!state.progressMsgId || !client) return;
+      // 仅暂时性错误（限流/网络）时保留句柄重试；永久错误则清空句柄
+      client.updateCard(state.progressMsgId, card).catch((err) => {
+        if (!isTransientError(err)) {
+          state.progressMsgId = null;
+          state.progressCreating = false;
+        }
+      });
+    }, CARD_PATCH_DEBOUNCE_MS);
+    if (typeof state.progressDebounceTimer === "object" && "unref" in state.progressDebounceTimer) {
+      (state.progressDebounceTimer as any).unref();
+    }
+  }
+
+  /** 安全发送：吞掉异步/同步异常，防止浮尾 Promise 击穿进程（M7） */
+  function safeSend(p: Promise<unknown>): void {
+    Promise.resolve(p).catch((e) => {
+      console.warn("[pi-feishu] send failed:", e?.message ?? e);
     });
   }
 

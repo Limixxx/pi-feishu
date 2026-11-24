@@ -24,6 +24,67 @@ function _warn(...args: unknown[]): void {
   console.warn("[FeishuClient]", ...args);
 }
 
+// ─── 限流识别与节流常量 ────────────────────────────────
+
+/** 飞书频率类错误码 */
+const RATE_LIMIT_CODES = new Set([9499, 230020, 230026]);
+/** 限流退避最大重试次数 */
+const RATE_LIMIT_RETRIES = 3;
+/** 限流退避单次等待上限（30s） */
+const RATE_LIMIT_MAX_MS = 30_000;
+/** 客户端发送节流 QPS */
+const SEND_QPS = 4;
+/** token bucket 单令牌间隔（250ms） */
+const SEND_MIN_INTERVAL_MS = 1000 / SEND_QPS;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** 从响应头读取 Retry-After / X-Ogw-Ratelimit-Reset（秒） */
+function readRetryAfter(err: any): number | null {
+  const headers = err?.response?.headers ?? err?.headers ?? {};
+  const raw =
+    headers["retry-after"] ??
+    headers["Retry-After"] ??
+    headers["x-ogw-ratelimit-reset"] ??
+    headers["X-Ogw-Ratelimit-Reset"];
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** 判断错误是否为限流（HTTP 429 / 频率错误码 / 错误文案） */
+function isRateLimited(err: any): boolean {
+  if (err?.response?.status === 429 || err?.status === 429) return true;
+  let code = err?.code;
+  if (code == null) {
+    // 部分 SDK 错误把 code 放在 data 中
+    code = err?.data?.code;
+  }
+  if (Number.isFinite(Number(code)) && RATE_LIMIT_CODES.has(Number(code))) return true;
+  const msg = String(err?.message ?? err?.data?.message ?? "");
+  return /too many request/i.test(msg) || /frequency limit/i.test(msg) || /rate limit/i.test(msg);
+}
+
+/** 是否为暂时性错误（限流/网络/5xx）——应保留本地状态，稍后重试 */
+export function isTransientError(err: any): boolean {
+  if (readRetryAfter(err) != null || isRateLimited(err)) return true;
+  const status = err?.response?.status ?? err?.status;
+  if (status != null && status >= 500 && status < 600) return true;
+  const code0 = err?.code ?? err?.data?.code;
+  if (
+    err &&
+    (code0 == null || code0 === "") &&
+    /network|socket|timeout|econn|etimedout|enotfound|ECONN|ETIMEDOUT|ENOTFOUND/i.test(
+      String(err?.message ?? err?.data?.message ?? ""),
+    )
+  ) {
+    return true;
+  }
+  return false;
+}
+
 // ─── 常量 ─────────────────────────────────────────────
 
 /** 消息去重 TTL（12 小时） */
@@ -94,6 +155,11 @@ export class FeishuClient {
   // 消息去重
   private dedupMap: Map<string, number> = new Map();
   private dedupSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+  // 发送节流：串行队列 + token bucket（约 SEND_QPS QPS）
+  private sendQueue: Promise<unknown> = Promise.resolve();
+  private bucketTokens: number = SEND_QPS;
+  private bucketLastRefill: number = Date.now();
 
   // Bot 身份（连接后探测）
   private botOpenId: string = "";
@@ -245,35 +311,88 @@ export class FeishuClient {
 
   // ─── 消息发送 ──────────────────────────────────────────
 
+  // ── 限流/节流辅助 ─────────────────────────────────────
+
+  /** token bucket 获取发送令牌（约 SEND_QPS QPS） */
+  private async acquireToken(): Promise<void> {
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      const now = Date.now();
+      const refill = (now - this.bucketLastRefill) / SEND_MIN_INTERVAL_MS;
+      this.bucketTokens = Math.min(SEND_QPS, this.bucketTokens + refill);
+      this.bucketLastRefill = now;
+      if (this.bucketTokens >= 1) {
+        this.bucketTokens -= 1;
+        return;
+      }
+      await sleep(10);
+    }
+  }
+
+  /** 串行化执行发送（排队），限流时自然形成背压 */
+  private enqueueSend<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.sendQueue.then(fn, fn);
+    this.sendQueue = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  /** 限流退避重试：识别限流后按 Retry-After 或指数退避（1s/2s/4s）重试，单次上限 30s */
+  private async retryWithBackoff<T>(fn: () => Promise<T>): Promise<T> {
+    let attempt = 0;
+    // eslint-disable-next-line no-constant-condition
+    while (true) {
+      try {
+        return await fn();
+      } catch (err: any) {
+        if (attempt >= RATE_LIMIT_RETRIES || !isRateLimited(err)) {
+          throw err;
+        }
+        const retryAfter = readRetryAfter(err);
+        const delay =
+          retryAfter != null
+            ? Math.min(retryAfter * 1000, RATE_LIMIT_MAX_MS)
+            : Math.min(1000 * 2 ** attempt, RATE_LIMIT_MAX_MS);
+        _warn(`Rate limited, retrying in ${delay}ms (attempt ${attempt + 1}/${RATE_LIMIT_RETRIES})`);
+        await sleep(delay);
+        attempt++;
+      }
+    }
+  }
+
   /** 发送文本消息到飞书（回复模式优先，使用 interactive 卡片格式） */
   async sendMessage(chatId: string, text: string, replyToMsgId?: string): Promise<void> {
     const card = FeishuClient.buildTextCard(text);
     const content = JSON.stringify(card);
 
-    try {
-      if (replyToMsgId) {
-        await this.client.im.message.reply({
-          path: { message_id: replyToMsgId },
-          data: { content, msg_type: "interactive" },
-        });
-      } else {
-        await this.client.im.message.create({
-          params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "interactive" },
-        });
-      }
-      _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""}`);
-    } catch (err: any) {
-      if (replyToMsgId && (err?.code === 230011 || err?.code === 231003)) {
-        _warn("Reply failed (message withdrawn), falling back to create");
-        await this.client.im.message.create({
-          params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "interactive" },
-        });
-      } else {
-        throw err;
-      }
-    }
+    return this.enqueueSend(async () => {
+      await this.acquireToken();
+      await this.retryWithBackoff(async () => {
+        try {
+          if (replyToMsgId) {
+            await this.client.im.message.reply({
+              path: { message_id: replyToMsgId },
+              data: { content, msg_type: "interactive" },
+            });
+          } else {
+            await this.client.im.message.create({
+              params: { receive_id_type: "chat_id" },
+              data: { receive_id: chatId, content, msg_type: "interactive" },
+            });
+          }
+          _log(`Message sent to ${chatId}${replyToMsgId ? ` (reply to ${replyToMsgId})` : ""}`);
+        } catch (err: any) {
+          if (replyToMsgId && (err?.code === 230011 || err?.code === 231003)) {
+            _warn("Reply failed (message withdrawn), falling back to create");
+            await this.client.im.message.create({
+              params: { receive_id_type: "chat_id" },
+              data: { receive_id: chatId, content, msg_type: "interactive" },
+            });
+          } else {
+            throw err;
+          }
+        }
+      });
+    });
   }
 
   /** 发送交互卡片消息 */
@@ -285,19 +404,23 @@ export class FeishuClient {
     const content = JSON.stringify(card);
 
     try {
-      if (replyToMsgId) {
-        const resp = await this.client.im.message.reply({
-          path: { message_id: replyToMsgId },
-          data: { content, msg_type: "interactive" },
+      return await this.enqueueSend(async () => {
+        await this.acquireToken();
+        return this.retryWithBackoff(async () => {
+          if (replyToMsgId) {
+            const resp = await this.client.im.message.reply({
+              path: { message_id: replyToMsgId },
+              data: { content, msg_type: "interactive" },
+            });
+            return resp?.data?.message_id ?? null;
+          }
+          const resp = await this.client.im.message.create({
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: chatId, content, msg_type: "interactive" },
+          });
+          return resp?.data?.message_id ?? null;
         });
-        return resp?.data?.message_id ?? null;
-      } else {
-        const resp = await this.client.im.message.create({
-          params: { receive_id_type: "chat_id" },
-          data: { receive_id: chatId, content, msg_type: "interactive" },
-        });
-        return resp?.data?.message_id ?? null;
-      }
+      });
     } catch (err: any) {
       _warn("Send card failed:", err?.message ?? err);
       return null;
@@ -306,9 +429,14 @@ export class FeishuClient {
 
   /** 更新（PATCH）已有的卡片消息 */
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
-    await this.client.im.message.patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(card) },
+    return this.enqueueSend(async () => {
+      await this.acquireToken();
+      await this.retryWithBackoff(async () => {
+        await this.client.im.message.patch({
+          path: { message_id: messageId },
+          data: { content: JSON.stringify(card) },
+        });
+      });
     });
   }
 
@@ -418,34 +546,44 @@ export class FeishuClient {
   async sendImage(chatId: string, imageKey: string, replyToMsgId?: string): Promise<void> {
     const content = JSON.stringify({ image_key: imageKey });
 
-    if (replyToMsgId) {
-      await this.client.im.message.reply({
-        path: { message_id: replyToMsgId },
-        data: { content, msg_type: "image" },
+    return this.enqueueSend(async () => {
+      await this.acquireToken();
+      await this.retryWithBackoff(async () => {
+        if (replyToMsgId) {
+          await this.client.im.message.reply({
+            path: { message_id: replyToMsgId },
+            data: { content, msg_type: "image" },
+          });
+        } else {
+          await this.client.im.message.create({
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: chatId, content, msg_type: "image" },
+          });
+        }
       });
-    } else {
-      await this.client.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: { receive_id: chatId, content, msg_type: "image" },
-      });
-    }
+    });
   }
 
   /** 发送文件消息（通过 file_key） */
   async sendFile(chatId: string, fileKey: string, replyToMsgId?: string): Promise<void> {
     const content = JSON.stringify({ file_key: fileKey });
 
-    if (replyToMsgId) {
-      await this.client.im.message.reply({
-        path: { message_id: replyToMsgId },
-        data: { content, msg_type: "file" },
+    return this.enqueueSend(async () => {
+      await this.acquireToken();
+      await this.retryWithBackoff(async () => {
+        if (replyToMsgId) {
+          await this.client.im.message.reply({
+            path: { message_id: replyToMsgId },
+            data: { content, msg_type: "file" },
+          });
+        } else {
+          await this.client.im.message.create({
+            params: { receive_id_type: "chat_id" },
+            data: { receive_id: chatId, content, msg_type: "file" },
+          });
+        }
       });
-    } else {
-      await this.client.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: { receive_id: chatId, content, msg_type: "file" },
-      });
-    }
+    });
   }
 
   // ─── Reaction 输入指示 ─────────────────────────────────
@@ -525,7 +663,12 @@ export class FeishuClient {
         `text=${(text ?? "").substring(0, 50)}..., resources=${resources.length}`,
       );
 
-      this.onMessageCallback?.(chatId, messageId, text ?? "", chatType, resources);
+      // 包装 onMessage 回调：不产生浮起拒绝（防 uncaughtException 导致进程退出）
+      Promise.resolve(
+        this.onMessageCallback?.(chatId, messageId, text ?? "", chatType, resources),
+      ).catch((cbErr: any) => {
+        _warn("Inbound message callback failed:", cbErr?.message ?? cbErr);
+      });
     } catch (err) {
       _warn("Error handling inbound message:", err);
     }
